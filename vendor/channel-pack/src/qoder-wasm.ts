@@ -717,7 +717,12 @@ export class QoderEncryptedInfer {
         // The url/body buffers are allocated by the wasm side and never freed
         // by it — `callString` already frees its return value the same way, and
         // leaving these leaked grew the heap once per inference request (#826).
-        g.freeString(outPtr, outLen)
+        //
+        // ⚠️ 释放**返回值**用这一句内联调用，而不是 #826 顺手加的 `g.freeString`：
+        // 后者是给「输入缓冲」用的，而输入缓冲的所有权在 Rust 侧，free 会
+        // 双重释放并 panic（见 `withStrings` 的长注释）。这里两者语义不同：
+        // 返回缓冲由 JS 接管（与 `callString` 的 finally 完全同源），可以释放。
+        if (outPtr) g.exports.__wbindgen_export4!(outPtr, outLen, 1)
       }
       return out
     }

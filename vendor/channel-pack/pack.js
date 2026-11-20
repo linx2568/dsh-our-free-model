@@ -38058,7 +38058,7 @@ var QoderEncryptedInfer = class _QoderEncryptedInfer {
         out = outPtr ? g.readString(outPtr, outLen) : "";
       } finally {
         g.exports.__wbindgen_add_to_stack_pointer(16);
-        g.freeString(outPtr, outLen);
+        if (outPtr) g.exports.__wbindgen_export4(outPtr, outLen, 1);
       }
       return out;
     };
