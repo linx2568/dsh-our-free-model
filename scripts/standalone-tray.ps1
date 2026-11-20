@@ -38,11 +38,21 @@ $iconPath = Join-Path $projectRoot "packages\desktop\src-tauri\icons\icon.ico"
 # 默认管理 URL
 $script:managementUrl = "http://127.0.0.1:$Port"
 $script:isManualExit = $false
+# 重启窗口期：此时旧进程已退出、新进程还没起来，定时器的「异常退出」判定
+# 必须让路，否则那两秒里会弹一个假的崩溃提示并把托盘整个关掉。
+$script:isRestarting = $false
 
 $errLog = Join-Path $logDir "standalone.err.log"
 
+# 首次拉起与「重启服务」复用同一个入口：命令行、重定向、隐藏窗口三处口径
+# 必须一致，否则托盘重启起来的进程和快捷方式首次拉起的不是同一个形态
+# （比如漏了 RedirectStandardOutput，就再也读不到新的登录链接）。
+function Start-NodeService {
+    Start-Process -FilePath "node.exe" -ArgumentList "packages/standalone/cli.mjs --port $Port" -WorkingDirectory $projectRoot -RedirectStandardOutput $logFile -RedirectStandardError $errLog -WindowStyle Hidden -PassThru
+}
+
 try {
-    $script:process = Start-Process -FilePath "node.exe" -ArgumentList "packages/standalone/cli.mjs --port $Port" -WorkingDirectory $projectRoot -RedirectStandardOutput $logFile -RedirectStandardError $errLog -WindowStyle Hidden -PassThru
+    $script:process = Start-NodeService
 } catch {
     [System.Windows.Forms.MessageBox]::Show(
         "启动 Node 服务失败，请确认系统已安装 Node.js 并且在环境变量 PATH 中。`n错误详情：$($_.Exception.Message)",
@@ -68,6 +78,55 @@ $notifyIcon.Visible = $true
 # 创建右键上下文菜单
 $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
 
+# 重启服务：按 PID 杀掉整个子进程树后原地拉起一个新的，托盘本身不退出
+# （图标、菜单、单实例互斥量都保留）。等价于「退出再双击快捷方式」，
+# 但少一次托盘重建，也不会撞上单实例提示。
+function Restart-NodeService {
+    $script:isRestarting = $true
+    try {
+        if ($script:process -and -not $script:process.HasExited) {
+            # /T 连子进程一起杀：cli.mjs 会 spawn 渠道 worker，只杀父进程会留下孤儿。
+            Start-Process "taskkill" -ArgumentList "/F /T /PID $($script:process.Id)" -WindowStyle Hidden -Wait
+            try { $script:process.WaitForExit(5000) | Out-Null } catch {}
+        }
+        # 等旧进程真正释放 stdout/stderr 句柄（否则新进程写同一个日志文件会失败），
+        # 顺便躲开端口可能的短暂 TIME_WAIT。
+        Start-Sleep -Milliseconds 400
+        $script:process = Start-NodeService
+        # 重置成裸地址：定时器只在「还没读到登录链接」时才刷新，
+        # 不重置的话新进程的新令牌永远读不进来，菜单会指向已失效的旧链接。
+        $script:managementUrl = "http://127.0.0.1:$Port"
+        Start-Sleep -Milliseconds 800
+        if ($script:process.HasExited) {
+            # 多半是端口还没放开：等两秒重试一次，仍失败才如实报错。
+            Start-Sleep -Seconds 2
+            $script:process = Start-NodeService
+            Start-Sleep -Milliseconds 800
+        }
+        if ($script:process.HasExited) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "重启后服务进程立即退出，请查看 logs/standalone.log 与 logs/standalone.err.log。",
+                "重启失败",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+            return
+        }
+        $notifyIcon.BalloonTipTitle = "Our Free Model 服务已重启"
+        $notifyIcon.BalloonTipText = "托盘保持运行；双击图标可打开管理面板（登录链接已刷新）。"
+        $notifyIcon.ShowBalloonTip(3000)
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "重启服务失败：$($_.Exception.Message)",
+            "重启失败",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        )
+    } finally {
+        $script:isRestarting = $false
+    }
+}
+
 $menuOpen = $contextMenu.Items.Add("打开管理面板")
 $menuOpen.Font = New-Object System.Drawing.Font($menuOpen.Font, [System.Drawing.FontStyle]::Bold)
 $menuOpen.add_Click({
@@ -79,6 +138,12 @@ $menuLog.add_Click({
     if (Test-Path $logFile) {
         [System.Diagnostics.Process]::Start("notepad.exe", "`"$logFile`"")
     }
+})
+
+# 重启服务（改完插件 / 合并完上游之后，用它比退出再双击快捷方式快一步）
+$menuRestart = $contextMenu.Items.Add("重启服务")
+$menuRestart.add_Click({
+    Restart-NodeService
 })
 
 $contextMenu.Items.Add("-") | Out-Null
@@ -114,6 +179,9 @@ $notifyIcon.ShowBalloonTip(3000)
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 2000
 $timer.add_Tick({
+    # 重启窗口期整轮跳过：旧进程刚被杀、新进程还没起来，此时 HasExited 为真，
+    # 不跳过就会误报「服务异常退出」并把托盘关掉（重启反而变成退出）。
+    if ($script:isRestarting) { return }
     if ($script:managementUrl -eq "http://127.0.0.1:$Port" -and (Test-Path $logFile)) {
         try {
             $content = [System.IO.File]::ReadAllText($logFile)
@@ -122,7 +190,7 @@ $timer.add_Tick({
             }
         } catch {}
     }
-    if ($script:process.HasExited -and -not $script:isManualExit) {
+    if ($script:process.HasExited -and -not $script:isManualExit -and -not $script:isRestarting) {
         $timer.Stop()
         $notifyIcon.Visible = $false
         [System.Windows.Forms.MessageBox]::Show(
