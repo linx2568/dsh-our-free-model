@@ -554,16 +554,15 @@ export async function toResponsesGenerateOptions(
   // sub2api 的成熟做法**降级成 auto**，而不是回 400：降级后模型仍能从已摊平的
   // 工具里挑，语义损失可接受；回 400 则会让 Codex 的整轮对话直接失败。
   const requestedChoice = body.tool_choice
+  const isNoneChoice = requestedChoice === 'none'
+    || (isObject(requestedChoice) && requestedChoice.type === 'none')
   const toolChoice = isObject(requestedChoice) && requestedChoice.type === 'namespace'
     ? 'auto'
-    : requestedChoice
+    : (isNoneChoice ? 'none' : requestedChoice)
   if (toolChoice !== undefined && toolChoice !== 'auto' && toolChoice !== 'none') {
     throw new OpenAiGatewayError('only tool_choice auto and none are supported')
   }
-  const tools = convertTools(toChatTools(body.tools, onDrop))
-  if (toolChoice === 'none' && tools !== undefined && tools.length > 0) {
-    throw unsupported('tool_choice none with tools cannot be represented by DSH')
-  }
+  const tools = isNoneChoice ? undefined : convertTools(toChatTools(body.tools, onDrop))
   const temperature = body.temperature === undefined ? undefined
     : typeof body.temperature === 'number' && Number.isFinite(body.temperature) ? body.temperature
       : (() => { throw new OpenAiGatewayError('temperature must be a finite number') })()

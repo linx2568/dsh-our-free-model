@@ -452,7 +452,9 @@ export async function toGenerateOptions(
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw new OpenAiGatewayError('messages must be a non-empty array')
   }
-  if (body.tool_choice !== undefined && body.tool_choice !== 'auto' && body.tool_choice !== 'none') {
+  const isNoneChoice = body.tool_choice === 'none'
+    || (typeof body.tool_choice === 'object' && body.tool_choice !== null && (body.tool_choice as { type?: unknown }).type === 'none')
+  if (body.tool_choice !== undefined && !isNoneChoice && body.tool_choice !== 'auto') {
     throw new OpenAiGatewayError('only tool_choice auto and none are supported')
   }
   const maxTokens = maxTokensOverride ?? (body.max_completion_tokens !== undefined
@@ -467,10 +469,7 @@ export async function toGenerateOptions(
     : typeof body.temperature === 'number' && Number.isFinite(body.temperature) ? body.temperature
       : (() => { throw new OpenAiGatewayError('temperature must be a finite number') })()
 
-  const tools = convertTools(body.tools)
-  if (body.tool_choice === 'none' && tools !== undefined && tools.length > 0) {
-    throw new OpenAiGatewayError('tool_choice none with tools cannot be represented by DSH', 400, 'unsupported_parameter', 'unsupported_parameter')
-  }
+  const tools = isNoneChoice ? undefined : convertTools(body.tools)
   // ⚠️ 这里用 `!== undefined` 而**不是** `??`：三态必须区分开。
   // - `undefined`：调用方没给（未传）→ 回退到 body 里的值（直连调用的老行为）；
   // - `null`：调用方**明确决定不下发**（模型未声明思考档位）→ 必须原样保留，
