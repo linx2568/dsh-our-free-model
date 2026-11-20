@@ -91,7 +91,9 @@ export async function createChannelRuntime({ dataDir, logger = console, stats })
       let first = 0
       let ok = false
       try {
-        const { signal, ...wire } = request
+        // `comboHop` 是链内标记，只在本进程内有效 —— 绝不能随 wire 发给 worker/
+        // 上游（多一个未知字段就可能被上游拒掉）。
+        const { signal, comboHop, ...wire } = request
         await call('complete', { request: wire }, signal, chunk => {
           if (!first) first = Date.now()
           foldForwardOutcome(outcome, chunk)
@@ -100,7 +102,12 @@ export async function createChannelRuntime({ dataDir, logger = console, stats })
         ok = outcome.error === undefined
         return outcome
       } finally {
-        if (!closed && stats) {
+        // ⚠️ `comboHop`：这一跳是 combo 内部的一次尝试，不是用户请求。
+        // **失败**的跳不记账 —— 否则「运行检查」会堆满中间跳的红卡片，而同一秒
+        // 里后面的候选其实已经成功回包（02:13 就是被这么误报的）；整条链的
+        // 失败由链主记一条（见 service.mjs 的 recordCombo）。
+        // 成功的跳仍照常记：按模型的用量统计要靠它，不然流量全跑到 combo 名下。
+        if (!closed && stats && !(request.comboHop === true && !ok)) {
           const usage = outcome.usage
           recordUsage(stats, {
             model: request.model, at: Date.now(), input: usage?.prompt_tokens ?? 0, output: usage?.completion_tokens ?? 0,

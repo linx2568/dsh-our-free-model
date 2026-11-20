@@ -4,6 +4,7 @@ import path from 'node:path'
 import net from 'node:net'
 import crypto from 'node:crypto'
 import { buildComboCatalog, comboChain, isComboEntry, normalizeCombos } from '../../src/combos.js'
+import { recordTurn, recordUsage } from '../../src/store.js'
 import { createModelRuntime, createRuntimeStores } from '../../src/core/runtime.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from '../../src/forward.js'
 import { isLoopbackHost } from '../../src/trust.js'
@@ -334,16 +335,29 @@ export async function startStandalone({
             throw Object.assign(new Error(`the chain "${comboEntry.name}" has no model available on this egress`), { statusCode: 502 })
           }
           const tried = []
+          // 链主记账：combo 内部失败的那几跳不再各自写样本（见 channels/runtime.mjs
+          // 的 `comboHop` 说明），只有「整条链都没成」才留一条用户可见的失败记录 ——
+          // 否则「运行检查」里会堆满中间跳的红卡片，而同一秒后面的候选其实已经成功。
+          const recordCombo = (model) => {
+            if (!stores.stats) return
+            try {
+              recordUsage(stores.stats, { at: Date.now(), model, ok: false, input: 0, output: 0, reasoning: 0, cacheRead: 0, origin: 'combo' })
+              recordTurn(stores.stats, { model, ok: false, recovered: false })
+            } catch { /* 统计写失败不能影响这次请求 */ }
+          }
           for (let index = 0; index < candidates.length; index++) {
             const candidate = candidates[index]
             const held = []
             let committed = false
             let outcome
             try {
-              const dispatch = channels.handles(candidate.id)
+              const isChannel = channels.handles(candidate.id)
+              const dispatch = isChannel
                 ? (req, cb) => channels.complete(req, cb)
                 : (req, cb) => core.complete(req, cb)
-              outcome = await dispatch({ ...request, model: candidate.id }, chunk => {
+              // comboHop 只对渠道候选生效：渠道运行时据此跳过逐跳记账；
+              // core 那条（插件车道）自己按逻辑回合记账，不受影响。
+              outcome = await dispatch({ ...request, model: candidate.id, ...isChannel ? { comboHop: true } : {} }, chunk => {
                 if (committed) {
                   onChunk?.(chunk)
                   return
@@ -370,6 +384,9 @@ export async function startStandalone({
             for (const c of held) onChunk?.(c)
             return outcome
           }
+          // 只有「整条链都没成」才记一条失败样本：中途被后续候选救回来的那些跳
+          // 已经在 runtime.mjs 里被 `comboHop` 拦掉了，这里补上用户真正遇到的失败。
+          recordCombo(comboEntry.id, false)
           throw Object.assign(new Error(`the chain "${comboEntry.name}" exhausted every candidate: ${tried.join('; ')}`), { statusCode: 502 })
         }
         return channels.handles(request.model) ? channels.complete(request, onChunk) : core.complete(request, onChunk)
