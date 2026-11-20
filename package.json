@@ -23,6 +23,8 @@
     "pack:standalone": "node scripts/pack-standalone.mjs",
     "test:package": "node scripts/standalone-package-test.mjs",
     "start:standalone": "node packages/standalone/cli.mjs",
+    "start:tray": "powershell -ExecutionPolicy Bypass -File scripts/standalone-tray.ps1",
+    "create:shortcut": "powershell -ExecutionPolicy Bypass -File scripts/create-desktop-shortcut.ps1",
     "test:standalone": "node scripts/standalone-test.mjs",
     "test:management": "node scripts/standalone-management-test.mjs",
     "build:standalone-channels": "node scripts/build-standalone-channels.mjs",

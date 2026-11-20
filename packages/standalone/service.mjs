@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import crypto from 'node:crypto'
+import { buildComboCatalog, comboChain, isComboEntry, normalizeCombos } from '../../src/combos.js'
 import { createModelRuntime, createRuntimeStores } from '../../src/core/runtime.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from '../../src/forward.js'
 import { isLoopbackHost } from '../../src/trust.js'
@@ -18,6 +19,16 @@ import { combineSubscriptionRuntimes, createMagpieModels } from '../../src/magpi
 
 const PRODUCT = 'our-free-model-standalone'
 const VERSION = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
+
+function commitsAnswer(chunk) {
+  if (chunk === null || typeof chunk !== 'object') return false
+  if (chunk.type === 'text-delta') return typeof chunk.text === 'string' && chunk.text.trim() !== ''
+  if (chunk.type === 'tool-call-delta') return true
+  if (chunk.type !== 'block-end') return false
+  if (chunk.block?.type === 'reasoning') return false
+  if (chunk.block?.type === 'text') return typeof chunk.block.text === 'string' && chunk.block.text.trim() !== ''
+  return true
+}
 
 export function resolveStandaloneDataDir(env = process.env, home = os.homedir()) {
   const configured = typeof env.OFM_HOME === 'string' ? env.OFM_HOME.trim() : ''
@@ -287,14 +298,82 @@ export async function startStandalone({
     })
     channels = await createChannelRuntime({ dataDir, logger, stats: stores.stats })
     const core = runtime
+
+    const baseCatalog = () => [
+      ...core.catalog.filter(row => !isComboEntry(row)),
+      ...channels.publicModelRows().map(row => ({ ...row, contextWindow: row.context_window, maxOutput: row.max_tokens })),
+    ]
+    const getCombos = () => {
+      const stored = normalizeCombos(stores.settings.get().combos)
+      return buildComboCatalog(stored, baseCatalog())
+    }
+
     runtime = {
       ...core,
       get egress() { return core.egress },
       get gatewayLatency() { return core.gatewayLatency },
-      get catalog() { return [...core.catalog, ...channels.publicModelRows().map(row => ({ ...row, contextWindow: row.context_window, maxOutput: row.max_tokens }))] },
-      state: () => ({ ...core.state(), catalog: [...core.catalog, ...channels.publicModelRows()] }),
-      publicModelRows: () => [...core.publicModelRows(), ...channels.publicModelRows()],
-      complete: (request, onChunk) => channels.handles(request.model) ? channels.complete(request, onChunk) : core.complete(request, onChunk),
+      get catalog() { return [...baseCatalog(), ...getCombos()] },
+      state: () => ({ ...core.state(), catalog: [...baseCatalog(), ...getCombos()] }),
+      publicModelRows: () => [
+        ...core.publicModelRows().filter(row => !row.id.startsWith('combo:')),
+        ...channels.publicModelRows(),
+        ...getCombos().map(entry => ({
+          id: entry.id,
+          object: 'model',
+          created: Math.floor(Date.now() / 1000),
+          owned_by: 'our-free-model',
+          ...entry.contextWindow === undefined ? {} : { context_window: entry.contextWindow },
+          ...entry.maxOutput === undefined ? {} : { max_tokens: entry.maxOutput },
+        })),
+      ],
+      complete: async (request, onChunk) => {
+        const comboEntry = getCombos().find(row => row.id === request.model || row.name === request.model)
+        if (comboEntry) {
+          const candidates = comboChain(comboEntry, [...baseCatalog(), ...getCombos()], core.state().routing ?? {})
+          if (candidates.length === 0) {
+            throw Object.assign(new Error(`the chain "${comboEntry.name}" has no model available on this egress`), { statusCode: 502 })
+          }
+          const tried = []
+          for (let index = 0; index < candidates.length; index++) {
+            const candidate = candidates[index]
+            const held = []
+            let committed = false
+            let outcome
+            try {
+              const dispatch = channels.handles(candidate.id)
+                ? (req, cb) => channels.complete(req, cb)
+                : (req, cb) => core.complete(req, cb)
+              outcome = await dispatch({ ...request, model: candidate.id }, chunk => {
+                if (committed) {
+                  onChunk?.(chunk)
+                  return
+                }
+                held.push(chunk)
+                if (commitsAnswer(chunk)) {
+                  committed = true
+                  for (const c of held) onChunk?.(c)
+                  held.length = 0
+                }
+              })
+            } catch (error) {
+              if (committed) throw error
+              tried.push(`${candidate.id} (${error.message || error})`)
+              logger.warn?.(`our-free-model standalone: chain "${comboEntry.name}" advanced past ${candidate.id} — ${error.message || error}`)
+              continue
+            }
+            if (committed) return outcome
+            if (outcome?.error !== undefined) {
+              tried.push(`${candidate.id} (${outcome.error})`)
+              logger.warn?.(`our-free-model standalone: chain "${comboEntry.name}" advanced past ${candidate.id} — ${outcome.error}`)
+              continue
+            }
+            for (const c of held) onChunk?.(c)
+            return outcome
+          }
+          throw Object.assign(new Error(`the chain "${comboEntry.name}" exhausted every candidate: ${tried.join('; ')}`), { statusCode: 502 })
+        }
+        return channels.handles(request.model) ? channels.complete(request, onChunk) : core.complete(request, onChunk)
+      },
       async refreshCatalog(options) {
         if (stopped) return
         const [result, channelResult] = await Promise.all([core.refreshCatalog(options), channels.refresh(options).catch(error => { if (!stopped) throw error })])
