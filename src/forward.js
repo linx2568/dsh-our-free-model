@@ -326,6 +326,8 @@ export async function bindForwardPort(server, { address, port, attempts = BIND_A
  */
 export async function startForwardServer({ config, complete, modelRows, log = () => {}, onTrace = () => {}, heartbeatMs = SSE_HEARTBEAT_MS, optimize = null, health = () => ({ ok: true, service: 'our-free-model' }), handleRequest }) {
   const server = http.createServer((req, res) => {
+    req.on('error', () => {})
+    res.on('error', () => {})
     const trace = traceRequest(req, res, 'forward', onTrace)
     void handle(req, res, trace).catch(error => {
       trace.setOutcome('failed')
@@ -335,7 +337,7 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
         const code = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500
         openAiError(res, code, code === 500 ? 'server_error' : 'invalid_request_error', String(error?.message ?? error))
       } else {
-        res.end()
+        try { res.end() } catch {}
       }
     })
   })
@@ -409,6 +411,10 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
   const requestedPort = Number.isFinite(Number(config().port)) ? Math.trunc(Number(config().port)) : 0
   const bound = await bindForwardPort(server, { address: bindAddress, port: requestedPort, log: message => log(`bind: ${message}`) })
   server.on('error', error => log(`listener error: ${error?.message ?? error}`))
+  server.on('clientError', (error, socket) => {
+    log(`client error: ${error?.message ?? error}`)
+    try { socket.destroy(error) } catch {}
+  })
   if (bound.fellBack) {
     const verdict = classifyBindError(bound.bindError)
     log(`port ${bound.requested} is taken (${verdict.code}); listening on ${bound.port} instead${verdict.hint === '' ? '' : ` — ${verdict.hint}`}`)
@@ -705,7 +711,10 @@ function corsHeaders() {
 }
 
 function sendSse(res, event) {
-  res.write(`data: ${JSON.stringify(event)}\n\n`)
+  if (res.writableEnded === true || res.destroyed === true) return
+  try {
+    res.write(`data: ${JSON.stringify(event)}\n\n`)
+  } catch {}
 }
 
 /**
@@ -733,7 +742,9 @@ export function startHeartbeat(res, intervalMs = SSE_HEARTBEAT_MS) {
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) return () => {}
   const timer = setInterval(() => {
     if (res.writableEnded === true || res.destroyed === true) return
-    res.write(': ping\n\n')
+    try {
+      res.write(': ping\n\n')
+    } catch {}
   }, intervalMs)
   timer.unref?.()
   const stop = () => clearInterval(timer)
@@ -926,10 +937,9 @@ async function chatCompletions(req, res, complete, options = {}) {
     // honest place for a dispatch failure is the stream itself. Ending silently
     // here is the empty-200 this endpoint's non-streaming branch already fixed.
     options.trace?.setOutcome('failed')
-    if (!res.destroyed) {
+    if (!res.destroyed && !res.writableEnded) {
       sendSse(res, { error: { message: String(error?.message ?? error), type: 'server_error' } })
-      res.write('data: [DONE]\n\n')
-      res.end()
+      try { res.write('data: [DONE]\n\n'); res.end() } catch {}
     }
     return
   }
@@ -939,9 +949,10 @@ async function chatCompletions(req, res, complete, options = {}) {
     // clean `finish_reason: stop` and no content is the empty-200 this endpoint's
     // non-streaming branch fixed, arriving by the other door.
     if (failureReply(res, outcome)) return
-    sendSse(res, { error: forwardFailure(outcome).error })
-    res.write('data: [DONE]\n\n')
-    res.end()
+    if (!res.destroyed && !res.writableEnded) {
+      sendSse(res, { error: forwardFailure(outcome).error })
+      try { res.write('data: [DONE]\n\n'); res.end() } catch {}
+    }
     return
   }
   // Finish reason mirrors the non-streaming branch, over the calls that
@@ -954,17 +965,19 @@ async function chatCompletions(req, res, complete, options = {}) {
   if (suppressed !== null) {
     // Same reasoning as the `outcome.error` branch above: the status line is
     // spent, so the only honest place left for the explanation is the stream.
-    sendSse(res, { error: { message: suppressed, type: 'server_error' } })
-    res.write('data: [DONE]\n\n')
-    res.end()
+    if (!res.destroyed && !res.writableEnded) {
+      sendSse(res, { error: { message: suppressed, type: 'server_error' } })
+      try { res.write('data: [DONE]\n\n'); res.end() } catch {}
+    }
     return
   }
-  sendSse(res, {
-    id, object: 'chat.completion.chunk', created, model,
-    choices: [{ index: 0, delta: {}, finish_reason: calls.length ? 'tool_calls' : outcome.truncated ? 'length' : 'stop' }],
-  })
-  res.write('data: [DONE]\n\n')
-  res.end()
+  if (!res.destroyed && !res.writableEnded) {
+    sendSse(res, {
+      id, object: 'chat.completion.chunk', created, model,
+      choices: [{ index: 0, delta: {}, finish_reason: calls.length ? 'tool_calls' : outcome.truncated ? 'length' : 'stop' }],
+    })
+    try { res.write('data: [DONE]\n\n'); res.end() } catch {}
+  }
 }
 
 /**

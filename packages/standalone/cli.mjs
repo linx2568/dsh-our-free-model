@@ -2,6 +2,13 @@
 import path from 'node:path'
 import { startStandalone } from './service.mjs'
 
+process.on('uncaughtException', error => {
+  process.stderr.write(`[uncaughtException] ${error?.stack || error}\n`)
+})
+process.on('unhandledRejection', error => {
+  process.stderr.write(`[unhandledRejection] ${error?.stack || error}\n`)
+})
+
 const usage = `Our Free Model 独立本地服务
 用法：node packages/standalone/cli.mjs [选项]
 
