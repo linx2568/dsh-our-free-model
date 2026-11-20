@@ -2,12 +2,14 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
+import { registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
 import { registerLobsteraiLlm } from './lobsterai-adapter.js'
 import { registerQoderLlm } from './qoder-adapter.js'
 import { registerTraeLlm } from './trae-adapter.js'
 import { registerClineLlm } from './cline-adapter.js'
 import { registerLoomyLlm, parseLoomyRemoteModels } from './loomy-adapter.js'
 import { registerRaccoonLlm } from './raccoon-adapter.js'
+import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { TraeAuth } from './trae-auth.js'
@@ -39,6 +41,7 @@ import { QODER, QODER_CN } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
 import { configureDeadModelStore, withDeadModelPruning } from './dead-model-store.js'
+import type { CodeArtsCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
@@ -66,7 +69,9 @@ import { deriveProjectId, opencodeUserAgent, opencodeUserAgentForVersion } from 
 import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './opencode-capability.js'
 import { closeAllProxyDispatchers } from './opencode-proxy.js'
 import { createChannelFetch, type ChannelOutlet } from './channel-fetch.js'
+import { attachDirectFetch, createDirectFetch, type SignedChannelOutlet } from './direct-fetch.js'
 export { createChannelFetch, parseWindowsProxy, channelProxyBypassed } from './channel-fetch.js'
+export { directFetch, directLane, createDirectFetch, closeDirectFetch } from './direct-fetch.js'
 import { execFile } from 'node:child_process'
 
 /**
@@ -245,15 +250,18 @@ export function makeReadImageRequest(ctx: Context) {
   }
 }
 
-export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?: ChannelOutlet } = {}): void {
+export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?: SignedChannelOutlet } = {}): void {
   const network = createChannelFetch({ outlet: config.outlet })
+  const signedNetwork = createDirectFetch({ outlet: config.outlet })
+  const detachSignedNetwork = attachDirectFetch(signedNetwork.fetch)
+  ctx.effect(() => () => { detachSignedNetwork(); void signedNetwork.close() })
   ctx.effect(() => () => { void network.close() })
   // 本插件自带 Channel Pack 设置页，关闭 0.1.7 起由 Config schema 反渲染的自动表单
   // （老契约没有 configure()，静默跳过）。
   suppressAutoSettingsPage(ctx)
 
   // provider 配置命名空间的注册**只在老契约（≤0.1.6）下执行**：
-
+  // 那时 `settings.register` 可用，十二个 namespace 分别对应 codearts 路由、
   // Qoder（qoder / qodercn）、TRAE（trae）、Cline（cline）、Loomy（loomy）、
   // Raccoon（raccoon）、MiniMax（minimax）与 Zcode（zcode）。
   //
@@ -263,10 +271,11 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
   // ⚠️ 2026-10-01 起各 provider 已**不再**声明为可配置 provider，故这批 namespace
   // 在模型设置页上已无消费者（详见该函数头的说明）。
   registerProviderSettings(
-    ctx, 'llm-lobsterai',
+    ctx, 'llm-codearts', 'llm-lobsterai',
     'llm-qoder', 'llm-qodercn', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
     'llm-minimax', 'llm-zcode', 'llm-gemini',
   )
+  const service = new CodeArtsAuth(ctx, { fetcher: signedNetwork.fetch })
   const pool = new AccountPool(ctx)
   const accountForRefresh = async (provider: string, accountId?: string) => {
     if (accountId === undefined) return pool.getAvailableAccount(provider, '')
@@ -303,6 +312,33 @@ export function apply(ctx: Context, config: { disableOpencode?: boolean; outlet?
       detachTokenLedger()
     }
   }, 'token-ledger-persistence')
+
+  const codearts = registerCodeArtsLlm(ctx, {
+    fetchImpl: signedNetwork.fetch,
+    credentialRef: credentialRef(CODEARTS_CREDENTIAL_REF),
+    resolveCredential: async () => {
+      // CodeArts **只认账号池**，与其余五个 provider 一致。
+      //
+      // ⚠️ 早期它额外支持「单凭据模式」（`CODEARTS_ACCESS_TOKEN`）：登录后把凭据
+      // 写到那个固定 ref，适配器在账号池取不到时回退去读它。该模式**已移除** ——
+      // 登录入口只有 Channel Pack 设置页，凭据一律写入 `CODEARTS_ACCOUNT_XXX`，
+      // 固定的 `CODEARTS_ACCESS_TOKEN` 不会再被写入或读取。
+      //
+      // 这里仍保留 `credentialRef` 选项，仅为满足适配器契约与报错文案
+      // （其余 provider 同样传各自的默认 ref，但都不再作为回退来源）。
+      const available = await pool.getAvailableAccount('codearts', '')
+      return available?.credential as CodeArtsCredential | undefined
+    },
+    // 续期按**账号池里的具体账号**走：`refreshAccountCredential` 读写的是
+    // `CODEARTS_ACCOUNT_XXX`，而旧的 `service.refresh()` 读写的是已废弃的
+    // 单凭据 ref —— 那会刷到另一个（不存在的）凭据上。
+    refresh: async () => {
+      const available = await pool.getAvailableAccount('codearts', '')
+      if (available) await service.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
+    },
+    fetchRemoteModels: () => service.refreshModels(pool),
+    accountPool: pool,
+  })
 
   /**
    * 在「候选为空、即将退到单凭据 ref」这一刻，先证明失败原因是不是**限流**。
@@ -1384,6 +1420,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
    * 「凭据一直刷不动」在日志里完全无痕（issue !IKIRTT 的可观测性条目）。
    */
   const refreshTargets: ReadonlyArray<readonly [string, (pool: AccountPool) => Promise<void>]> = [
+    ['codearts', (p) => service.refreshAll(p)],
     ['lobsterai', (p) => lobsterai.refreshAll(p)],
     ['qoder', (p) => qoder.refreshAll(p)],
     ['qodercn', (p) => qoderCn.refreshAll(p)],
@@ -1449,6 +1486,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     refreshTimer.unref?.()
     ctx.effect(() => () => {
       clearInterval(refreshTimer)
+      service.stop()
       lobsterai.stop()
       qoder.stop()
       qoderCn.stop()
@@ -1472,6 +1510,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
 
   // 保留旧的 stop scheduler（兼容旧命令）
   ctx.effect(() => () => {
+    service.stop()
     lobsterai.stop()
     qoder.stop()
     qoderCn.stop()
@@ -1645,8 +1684,9 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     }
   }
   const modelAdapters: Record<string, { listAllModels(): readonly { id: string; name: string }[] }> = {
-
+    // `codearts` 是 registerCodeArtsLlm 返回的**适配器实例**（与 CodeArtsAuth
     // 服务实例 `service` 不同名，故这里可以简写）。
+    codearts: pruned(CODEARTS_PROVIDER, codearts),
     lobsterai: pruned(LOBSTERAI.id, lobsteraiAdapter),
     qoder: pruned(QODER.id, qoderAdapter),
     qodercn: pruned(QODER_CN.id, qoderCnAdapter),
@@ -1665,8 +1705,9 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 丢的却是「下一轮工具调用能不能带上签名」。
   ctx.effect(() => () => { void geminiSigStore.flush().catch(() => {}) })
 
-  registerChannelPackRpc(ctx, pool, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, {
+  registerChannelPackRpc(ctx, pool, service, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, {
     ...config,
+    codeartsFetcher: signedNetwork.fetch,
     // ⚠️ 配额等附属查询必须复用同一出口；省略会让 gemini-credits 回落到裸 fetch。
     fetcher: network.fetch,
   })

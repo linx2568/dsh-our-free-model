@@ -69,6 +69,10 @@ export interface OpenAiChatRequest {
 
 export function normalizeMaxTokens(value: number | undefined, provider: string, model: string): number | undefined {
   if (value === undefined) return undefined
+  // GLM-5.2 与 DeepSeek V4 实测均会拒绝 128000，65536 可正常推理。
+  if (provider === 'codearts' && (/^deepseek-v4-(flash|pro)$/.test(model) || model === 'GLM-5.2')) {
+    return Math.min(value, 65536)
+  }
   return value
 }
 /**
@@ -124,6 +128,9 @@ export function normalizeReasoningEffort(
 ): string | null | undefined {
   if (requested === undefined) return undefined
   const value = String(requested)
+  if (provider === 'codearts' && model !== undefined) {
+    return isThinkingOffEffort(value) ? 'off' : 'on'
+  }
   const record = modelInfo as { reasoning?: { efforts?: readonly { id?: unknown }[] } } | undefined
   const declared = (record?.reasoning?.efforts ?? [])
     .map((effort) => String((effort as { id?: unknown } | undefined)?.id))

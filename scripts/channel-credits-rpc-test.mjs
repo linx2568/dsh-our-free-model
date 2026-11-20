@@ -157,7 +157,7 @@ async function verifyGeminiQuotaUsesChannelFetcher({ call, outletState }) {
 
 async function verifyRefreshDispatch({ ctx, call }) {
   const providers = [
-    'lobsterai', 'qoder', 'qodercn', 'trae',
+    'codearts', 'lobsterai', 'qoder', 'qodercn', 'trae',
     'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini',
   ]
   for (const provider of providers) {
@@ -185,5 +185,5 @@ async function verifyRefreshDispatch({ ctx, call }) {
       await ctx.accountPool.removeAccount(accountId)
     }
   }
-  console.log('ok  refresh RPC: all 10 providers pass exact ref/pool/id; disabled accounts refresh; failures return ok:false')
+  console.log('ok  refresh RPC: all 11 providers pass exact ref/pool/id; disabled accounts refresh; failures return ok:false')
 }

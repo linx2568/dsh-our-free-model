@@ -18,6 +18,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { isSupportedProvider } from './channel-pack-store.js'
+import { directFetch } from './direct-fetch.js'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from './account-pool.js'
 import { isGatewayEnabled } from './openai-gateway/config.js'
@@ -29,6 +30,8 @@ import {
   isGatewayRunning,
   setGatewayDesiredEnabled,
 } from './openai-gateway/runtime.js'
+import type { CodeArtsAuth } from './service.js'
+import type { CodeArtsCredential } from './types.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
 import type { QoderAuth } from './qoder-auth.js'
 import type { TraeAuth } from './trae-auth.js'
@@ -106,6 +109,10 @@ import {
   claimLobsteraiDailyCheckin,
   fetchLobsteraiCreditBalance,
 } from './lobsterai-credits.js'
+import {
+  claimCodeArtsDailyCheckin,
+  fetchCodeArtsAccountInfoDetailed,
+} from './codearts-credits.js'
 import {
   claimTraeDailyCheckin,
   fetchTraeCheckinStatus,
@@ -271,6 +278,18 @@ export function normalizeZcodeLoginProvider(raw: string | undefined): ZcodeLogin
     }
   }
   return ZCODE_LOGIN_PROVIDER
+}
+
+/** 解析 CodeArts 凭据 JSON；解析失败返回 undefined。 */
+function parseCodeArtsCredential(raw: string): CodeArtsCredential | undefined {
+  try {
+    const parsed = JSON.parse(raw) as CodeArtsCredential
+    return typeof parsed === 'object' && parsed !== null && typeof parsed.access_key_id === 'string'
+      ? parsed
+      : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** 解析 LobsterAI 凭据 JSON；解析失败返回 undefined。 */
@@ -728,6 +747,8 @@ function providerIdsOf(
 /** RPC 的可选配置；追加字段以兼容现有 provider / modelAdapters 的位置参数调用。 */
 export interface ChannelPackRpcConfig {
   disableOpencode?: boolean
+  /** 本插件实例的 CodeArts 签名传输；旧调用省略时沿用 directFetch。 */
+  codeartsFetcher?: typeof fetch
   /**
    * 渠道出网实现（`src/index.ts` 里的 `network.fetch`）。
    *
@@ -748,6 +769,7 @@ export interface ChannelPackRpcConfig {
 export function registerChannelPackRpc(
   ctx: Context,
   pool: AccountPool,
+  codearts: CodeArtsAuth,
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
   /** Qoder **中国版**实例（与 `qoder` 同协议、不同 product；RPC 分支按注册表分派）。 */
@@ -780,7 +802,7 @@ export function registerChannelPackRpc(
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
     registerChannelPackEndpoints(
-      connectionCtx as Context, pool, lobsterai,
+      connectionCtx as Context, pool, codearts, lobsterai,
       qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, config,
     )
   })
@@ -881,6 +903,7 @@ async function fullCatalogIds(
 function registerChannelPackEndpoints(
   ctx: Context,
   pool: AccountPool,
+  codearts: CodeArtsAuth,
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
   qoderCn: QoderAuth,
@@ -1273,6 +1296,17 @@ function registerChannelPackEndpoints(
     if ((request?.provider !== undefined && !isSupportedProvider(request.provider)) || (account !== undefined && !isSupportedProvider(account.provider))) {
       return { ok: false, error: { code: 'provider-unsupported', message: '不支持此渠道。' } }
     }
+    // 每个 RPC 独立绑定传输与取消信号，避免使用最后挂载上下文的默认出口。
+    // 合并上游自行设置的超时，既保留超时也响应客户端断开；后台调用可省略 signal。
+    const codeartsFetcher: typeof fetch = (input, init) => {
+      const fetcher = config.codeartsFetcher ?? directFetch
+      if (!signal) return fetcher(input, init)
+      const upstreamSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
+      return fetcher(input, {
+        ...init,
+        signal: upstreamSignal ? AbortSignal.any([signal, upstreamSignal]) : signal,
+      })
+    }
     if (method.startsWith('opencode.')) {
       if (config.disableOpencode === true) {
         return { ok: false, error: { code: 'provider-disabled', message: 'OpenCode account integration is disabled in this host' } }
@@ -1296,7 +1330,40 @@ function registerChannelPackEndpoints(
         const id = `${provider}-${shortId()}`
         const suffix = shortId().toUpperCase()
         const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`
-if (provider === LOBSTERAI.id) {
+
+        if (provider === 'codearts') {
+          // CodeArts 也是**回调式**登录（本地回调服务器收授权码），但同样必须
+          // 走两步式：先返回 loginUrl 让前端立刻 window.open，后台再等回调。
+          const started = await codearts.startLogin({ refName })
+          // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
+          // 登录成功后再回填昵称/有效期等真实字段。
+          await pool.addAccount({
+            id,
+            provider: 'codearts',
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          started.result.then(async (loginResult) => {
+            const credential = parseCodeArtsCredential(loginResult.access)
+            await pool.updateAccount(id, {
+              nickname: credential?.user_name !== undefined && credential.user_name.length > 0
+                ? credential.user_name
+                : id,
+              expiresAt: credential?.expires_at !== undefined
+                ? (Number.isNaN(Date.parse(credential.expires_at)) ? undefined : Date.parse(credential.expires_at))
+                : undefined,
+              refreshable: Boolean(credential?.refresh_token),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[channel-pack] background codearts login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+        } else if (provider === LOBSTERAI.id) {
 
           const started = await lobsterai.startLogin({ refName })
           await pool.addAccount({
@@ -1827,6 +1894,9 @@ if (provider === LOBSTERAI.id) {
           // 调用方是仓库外的脚本/手工 RPC。下面三处历史注释曾把它写成
           // 「账号卡片的刷新按钮」——那是失实的，会把排障的人引到不存在的 UI。
           switch (entry.provider) {
+            case 'codearts':
+              await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id)
+              break
             case LOBSTERAI.id:
               await lobsterai.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
@@ -2316,6 +2386,20 @@ if (provider === LOBSTERAI.id) {
       // 各渠道显式分派协议，未知或退役渠道不调用任何默认端点。
       case 'credits.status': {
         const req = payload as RpcCreditsStatusRequest
+        if (req.provider === 'codearts') {
+          // CodeArts 没有独立的「签到状态」端点：可领状态要经
+          // `statistics/plugin`（判断是否积分账户）与 `v1/ops/delivery`
+          //（活动列表）两步网络请求，且不提供轻量的按账号只读状态（没有 has_claimed
+          // / daily_credit 等概念）。
+          // 故与 LobsterAI 同样如实返回 null，而不是臆造一份状态对象。
+          const accounts = await pool.listAccounts(req.provider)
+          return {
+            ok: true,
+            value: {
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
+            } satisfies RpcCreditsStatusResponse,
+          }
+        }
         if (req.provider === LOBSTERAI.id) {
           // LobsterAI 没有独立的「签到状态」端点：活动状态要经
 
@@ -2390,6 +2474,17 @@ if (provider === LOBSTERAI.id) {
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
         const accounts = await pool.listAccounts(req.provider)
+        if (req.provider === 'codearts') {
+          // 领取流程自带「账户类型 + 活动列表」预检（见 claimCodeArtsDailyCheckin），
+          // 用 fetchCheckinStatus 打华为端点既发错请求又必然失败。
+          const value = await collectClaimResults<CodeArtsCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            claim: (credential) => claimCodeArtsDailyCheckin(credential, codeartsFetcher),
+            precheckStatus: false,
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+        }
         if (isQoderFamily(req.provider)) {
           const { product } = requireQoderFamily(req.provider)
           // Qoder 的领取流程**自带活动列表查询**（loadCampaigns → 逐个 claim），
@@ -2601,6 +2696,37 @@ if (provider === LOBSTERAI.id) {
       case 'credits.balances': {
         const req = payload as RpcCreditsBalancesRequest
         const accounts = await pool.listAccounts(req.provider)
+        if (req.provider === 'codearts') {
+          // 余额来自 `statistics/plugin`（与账户类型检测同一个响应），
+          // 故用带原因的钩子：非积分账户要显示「Token 计费账户」而不是
+          // 误导性的「余额查询失败」。
+          const values = await collectCreditBalances<CodeArtsCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchBalanceDetailed: async (credential) => {
+              // 用带原因的版本：`fetchCodeArtsAccountInfo` 只回 null，会把
+              // 「AK 限流」「签名失败」「凭据过期」压成同一句笼统文案，
+              // 用户与排查者都拿不到线索（本端点就因此把一次 401 显示成了
+              // 无信息量的「账户信息查询失败」）。
+              const result = await fetchCodeArtsAccountInfoDetailed(credential, codeartsFetcher)
+              if (!result.ok) return { balance: null, error: `账户信息查询失败：${result.message}` }
+              const info = result.info
+              if (!info.isCreditPackage) {
+                return {
+                  balance: null,
+                  error: info.isTokenPackage
+                    ? 'Token 计费账户，无积分余额'
+                    : '非积分计费账户，无积分余额',
+                }
+              }
+              // 积分账户但没有 credit metric：如实报「无积分数据」，
+              // 不显示成 0 —— 0 会让用户以为自己把积分用光了。
+              if (info.credit === undefined) return { balance: null, error: '未返回积分数据' }
+              return { balance: info.credit }
+            },
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
         if (req.provider === LOBSTERAI.id) {
           const values = await collectCreditBalances<LobsteraiCredential, typeof LOBSTERAI>(accounts, LOBSTERAI, {
             resolve: (ref) => ctx.credentials.resolve(ref),

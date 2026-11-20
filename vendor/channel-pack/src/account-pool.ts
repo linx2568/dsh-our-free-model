@@ -6,6 +6,7 @@ import type { ChannelPackStore, ChannelPackState, ModelDisableMap, PermanentLock
 import { createPermanentLockStore } from './permanent-lock-store.js'
 import type { PermanentLockStore } from './permanent-lock-store.js'
 import type {
+  CodeArtsCredential,
   ProviderAccountEntry,
   ProviderAccountStatus,
 } from './types.js'
@@ -739,7 +740,8 @@ export class AccountPool {
   async findAccountIdByCredential(provider: string, identity: string): Promise<string> {
     if (identity.length === 0) return ''
 
-    const identifierKey = 'access_token'
+    // CodeArts 用 access_key_id。选错字段会导致匹配恒失败，限流记录无法归属账号。
+    const identifierKey = provider === 'codearts' ? 'access_key_id' : 'access_token'
     for (const entry of this.readAccounts()) {
       if (entry.provider !== provider || !entry.enabled) continue
       const resolved = await this.resolveCredentialByRef(entry.credentialRef)
@@ -849,12 +851,12 @@ export class AccountPool {
    */
   async resolveCredentialForAccount(
     id: string,
-  ): Promise<StoredTokenCredential | undefined> {
+  ): Promise<CodeArtsCredential | StoredTokenCredential | undefined> {
     const entry = this.findAccount(id)
     if (entry === undefined) return undefined
     const parsed = await this.resolveCredentialByRef(entry.credentialRef)
     if (parsed === undefined) return undefined
-    return parsed as unknown as StoredTokenCredential
+    return parsed as unknown as CodeArtsCredential | StoredTokenCredential
   }
 
   /**
@@ -922,7 +924,7 @@ export class AccountPool {
     provider: string,
     modelId: string,
     excludeAccountIds?: ReadonlySet<string>,
-  ): Promise<{ entry: ProviderAccountEntry; credential: StoredTokenCredential } | null> {
+  ): Promise<{ entry: ProviderAccountEntry; credential: CodeArtsCredential | StoredTokenCredential } | null> {
     const candidates = this.readAccounts()
       .filter(a => a.provider === provider && a.enabled)
       .filter(a => excludeAccountIds === undefined || !excludeAccountIds.has(a.id))
@@ -960,7 +962,7 @@ export class AccountPool {
         continue
       }
       try {
-        const credential = JSON.parse(resolved.value) as StoredTokenCredential
+        const credential = JSON.parse(resolved.value) as CodeArtsCredential | StoredTokenCredential
         if (failures.length > 0) {
           this.ctx.logger?.warn?.(
             `[channel-pack] ${failures.length} 个 ${provider} 账号不可用，已跳过：${failures.join('; ')}`,

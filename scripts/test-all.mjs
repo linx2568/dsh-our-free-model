@@ -160,6 +160,7 @@ const suites = [
   ['model-test-finish-integration', 'model-test-finish-integration-test.mjs', []],
   ['bench-integration', 'bench-integration-test.mjs', []],
   ['plugin-bench-ui', 'plugin-bench-ui-test.mjs', []],
+  ['codearts-direct-fetch', 'codearts-direct-fetch-test.mjs', []],
   ['gateway-source', 'gateway-source-test.mjs', []],
   ['gateway-disconnect', 'gateway-disconnect-test.mjs', []],
   ['standalone-nav', 'standalone-nav-test.mjs', []],
