@@ -66665,6 +66665,7 @@ async function* consumeMinimaxSse(options) {
           type: "tool-call-delta",
           index,
           id: ToolCallId7(state?.toolId ?? ""),
+          ...state?.toolName ? { name: state.toolName } : {},
           argumentsDelta: d.partial_json
         };
       }
