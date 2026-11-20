@@ -37855,21 +37855,14 @@ async function createGlue() {
     lastLength = encoded.length;
     return ptr;
   };
-  const freeString = (ptr, len) => {
-    if (ptr) exports.__wbindgen_export4(ptr, len, 1);
-  };
   const withStrings = (texts, invoke) => {
     const pointers = [];
     const lengths = [];
-    try {
-      for (const text of texts) {
-        pointers.push(writeString(text));
-        lengths.push(lastLength);
-      }
-      return invoke(pointers, lengths);
-    } finally {
-      for (let i = 0; i < pointers.length; i++) freeString(pointers[i], lengths[i]);
+    for (const text of texts) {
+      pointers.push(writeString(text));
+      lengths.push(lastLength);
     }
+    return invoke(pointers, lengths);
   };
   const callString = (invoke) => {
     let ptr = 0;
@@ -37969,7 +37962,6 @@ async function createGlue() {
     view,
     readString: readString7,
     writeString,
-    freeString,
     withStrings,
     lastLength: () => lastLength,
     heapObject,

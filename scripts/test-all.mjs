@@ -79,6 +79,9 @@ const suites = [
   ['turn-accounting', 'turn-accounting-test.mjs', []],
   ['chan-relay', 'chan-relay-test.mjs', []],
   ['channel-pack', 'channel-pack-test.mjs', []],
+  // 真跑 wasm 的一条：其余 Qoder 用例都把 QoderEncryptedInfer 桩掉，
+  // 2.8.9 的 #826（free 输入缓冲导致 panic）正是从这个缺口进来的。
+  ['qoder-wasm', 'qoder-wasm-test.mjs', []],
   ['channel-pack-gate', 'channel-pack-gate-test.mjs', []],
   ['auto-checkin-tick', 'auto-checkin-tick-test.mjs', []],
   ['channel-source', 'channel-pack-test.mjs', ['--source', '--channels-only']],

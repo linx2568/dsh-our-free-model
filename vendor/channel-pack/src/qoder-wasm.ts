@@ -340,10 +340,9 @@ interface Glue {
   readString: (ptr: number, len: number) => string
   /** 写字符串进 wasm 内存，返回指针（长度经 `lastLength` 传出）。 */
   writeString: (text: string) => number
-  /** 释放 `writeString` 分配的缓冲区（`__wbindgen_free` 的配对）。 */
-  freeString: (ptr: number, len: number) => void
   /**
-   * 分配若干输入串、执行调用、无论成败都释放它们。
+   * 分配若干输入串、执行调用。**不释放**这些缓冲区 —— Rust 侧按所有权接管
+   * 入参，JS 再 free 会双重释放（见实现处的长注释与上游 #826 的本地回退）。
    * 回调收到的指针与长度按入参顺序排列。
    */
   withStrings: <T>(texts: string[], invoke: (pointers: number[], lengths: number[]) => T) => T
@@ -425,32 +424,33 @@ async function createGlue(): Promise<Glue> {
     return ptr
   }
   /**
-   * Free a buffer `writeString` allocated.
+   * 把若干输入串写进 wasm 内存，执行调用，**不释放**这些缓冲区。
    *
-   * `__wbindgen_export2` is wasm-bindgen's `__wbindgen_malloc` and
-   * `__wbindgen_export4` its `__wbindgen_free` — the same pair `callString`
-   * already uses for the *returned* buffer. Every input buffer `writeString`
-   * hands to a wasm export leaked, because nothing ever called the free half
-   * (issue #826: the glue grew the wasm heap on each call and the leak was
-   * proportional to argument size). The wasm side copies the bytes it needs
-   * during the call, so freeing right after it returns is safe.
+   * ⚠️ **不要在这里 free —— 这是对上游 #826 的本地回退**（2.8.9）。
+   *
+   * #826 的主张是「输入缓冲一直泄漏，调用后按 `__wbindgen_export4(ptr, len, 1)`
+   * 释放即可」。实测**不成立**：释放这一步直接让 wasm 抛
+   * `RuntimeError: unreachable`，调用栈落在 `freeString` 里面 ——
+   * 说明这些入口的参数在 Rust 侧是**按所有权接管**的（String，而非借用的
+   * `&str`），JS 再 free 就是双重释放。后果不是「偶尔出错」，而是整个
+   * Qoder / Qoder CN 车道**在本地就 panic**，combo 层只会看到一句
+   * `unreachable`（与 #669 同型：wasm panic 被摊平成 502 unreachable），
+   * 请求根本到不了上游 —— 症状看起来像额度/网络问题，极难定位。
+   *
+   * 验证方式（可复现）：把 `generateRuntimeAuthFields` 单独打包调用，
+   * 带 free 时第一次就 trap，去掉 free 后连调 30 次正常。
+   *
+   * 代价是退回 2.8.9 之前的「每次调用泄漏参数字节数」状态 —— 有界、且与
+   * 长期在用的行为一致；等上游给出正确的释放口径（或确认为借用语义）再补。
    */
-  const freeString = (ptr: number, len: number): void => {
-    if (ptr) exports.__wbindgen_export4!(ptr, len, 1)
-  }
-  /** Allocate, run, and always free every input buffer written for the call. */
   const withStrings = <T>(texts: string[], invoke: (pointers: number[], lengths: number[]) => T): T => {
     const pointers: number[] = []
     const lengths: number[] = []
-    try {
-      for (const text of texts) {
-        pointers.push(writeString(text))
-        lengths.push(lastLength)
-      }
-      return invoke(pointers, lengths)
-    } finally {
-      for (let i = 0; i < pointers.length; i++) freeString(pointers[i], lengths[i])
+    for (const text of texts) {
+      pointers.push(writeString(text))
+      lengths.push(lastLength)
     }
+    return invoke(pointers, lengths)
   }
   const callString = (invoke: (stack: number) => void): string => {
     let ptr = 0
@@ -567,7 +567,6 @@ async function createGlue(): Promise<Glue> {
     view,
     readString,
     writeString,
-    freeString,
     withStrings,
     lastLength: () => lastLength,
     heapObject,
